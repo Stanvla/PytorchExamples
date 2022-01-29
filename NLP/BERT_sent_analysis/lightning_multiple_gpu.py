@@ -6,7 +6,6 @@ import os
 import pandas as pd
 from datetime import datetime
 import warnings
-ic(os.getcwd())
 
 import transformers as ppb
 import torch
@@ -14,13 +13,13 @@ from torch import nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
-# from NLP.BERT_sent_analysis.data_preporation import import collate_fn, ReviewsDataset
 from data_preporation import  collate_fn, ReviewsDataset
 
 import pytorch_lightning as pl
 from torchmetrics.functional import accuracy
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning import seed_everything
 
 
 class BertClassifierPL(pl.LightningModule):
@@ -107,15 +106,19 @@ class BertClassifierPL(pl.LightningModule):
 
         self.logger.experiment.add_scalar('Loss/Val', val_loss, self.current_epoch)
         self.logger.experiment.add_scalar('Acc/Val', val_acc, self.current_epoch)
-        self.logger.experiment.add_scalar('Size/Val', aggregated_output['cnt'], self.current_epoch)
 
-        # self.log('val_acc', val_acc, logger=False)
-        # self.log('val_loss', val_loss,logger=False)
+        self.log('val_acc', val_acc, logger=False, sync_dist=True)
+        self.log('val_loss', val_loss,logger=False, sync_dist=True)
 
-    # def training_epoch_end(self, outputs):
-    #     train_loss, train_acc = self._aggregate_output('loss', 'acc', outputs)
-    #     self.logger.experiment.add_scalar('Loss/Train', train_loss, self.current_epoch)
-    #     self.logger.experiment.add_scalar('Acc/Train', train_acc, self.current_epoch)
+    def training_epoch_end(self, outputs):
+        aggregated_output = self._aggregate_output('loss', 'acc', outputs)
+        aggregated_output = self.all_gather(aggregated_output)
+        aggregated_output = {k: sum(val) for k, val in aggregated_output.items()}
+        train_acc = aggregated_output['acc'] / aggregated_output['cnt']
+        train_loss = aggregated_output['loss'] / aggregated_output['cnt']
+
+        self.logger.experiment.add_scalar('Loss/Train', train_loss, self.current_epoch)
+        self.logger.experiment.add_scalar('Acc/Train', train_acc, self.current_epoch)
 
 
 # A DataModule implements 6 key methods:
@@ -141,10 +144,11 @@ class ReviewsDataModulePL(pl.LightningDataModule):
     def setup(self, stage: Optional[str] = None):
         df = pd.read_csv('https://github.com/clairett/pytorch-sentiment-classification/raw/master/data/SST2/train.tsv', delimiter='\t', header=None)
         tokenizer = tokenizer_class.from_pretrained(pretrained_weights)
+
         reviews_dataset = ReviewsDataset(df[0], tokenizer, df[1])
-        torch.manual_seed(self.seed)
         train_size, val_size = int(self.train_perc * len(reviews_dataset)), int(self.val_perc * len(reviews_dataset))
         self.train_data, self.valid_data, self.test_data = random_split(reviews_dataset, [train_size, val_size, len(reviews_dataset) - train_size - val_size])
+
         ic(len(self.train_data))
         ic(len(self.valid_data))
         ic(len(self.test_data))
@@ -167,12 +171,11 @@ def version_from_params(p, shortcuts):
 if __name__ == '__main__':
     # Todo:
     #   1. Process data only once ... done
-    #   2. Logging with multi-gpu
-    #   3. Checkpoints with multi-gpu
-    #   4.
-    #   5.
+    #   2. Logging with multi-gpu ... done
+    #   3. Checkpoints with multi-gpu ... done
     # %%
     ic('start')
+
     warnings.filterwarnings('ignore')
     params = dict(
         train_size=0.8,
@@ -186,6 +189,7 @@ if __name__ == '__main__':
         clip=1,
         save_fname='best_bert_sentiment.pt',
     )
+    seed_everything(params['seed'], workers=True)
 
     # .......................................................... Loading a pretrained model ........................................................
     # For DistilBERT, Load pretrained model/tokenizer:
@@ -236,7 +240,7 @@ if __name__ == '__main__':
     pl_model = BertClassifierPL(model, params)
 
     cb = [loss_checkpoint_callback, acc_checkpoint_callback]
-    trainer = pl.Trainer(gpus=2, strategy='ddp', logger=logger, num_sanity_val_steps=0, max_epochs=2, callbacks=cb)
+    trainer = pl.Trainer(gpus=2, strategy='ddp', logger=logger, num_sanity_val_steps=0, max_epochs=2, callbacks=cb, deterministic=True)
     trainer.fit(pl_model, dataset)
     ic('end')
 
