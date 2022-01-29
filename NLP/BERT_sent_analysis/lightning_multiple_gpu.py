@@ -1,4 +1,6 @@
 # %%
+from typing import Optional
+
 from icecream import ic
 import os
 import pandas as pd
@@ -22,9 +24,9 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 
 
 class BertClassifierPL(pl.LightningModule):
-    def __init__(self, pretrained_model, params):
+    def __init__(self, model, params):
         super(BertClassifierPL, self).__init__()
-        self.bert = pretrained_model
+        self.bert = model
         self.params = params
 
         self.dropout = nn.Dropout(p=params['do'])
@@ -105,12 +107,56 @@ class BertClassifierPL(pl.LightningModule):
         self.logger.experiment.add_scalar('Acc/Train', train_acc, self.current_epoch)
 
 
+# A DataModule implements 6 key methods:
+#   prepare_data (things to do on 1 GPU/TPU not on every GPU/TPU in distributed mode, e.g. downloading data only once).
+#   setup (things to do on every accelerator in distributed mode) called on every process in DDP.
+#   train_dataloader the training dataloader.
+#   val_dataloader the val dataloader(s).
+#   test_dataloader the test dataloader(s).
+#   teardown (things to do on every accelerator in distributed mode when finished, e.g. clean up after fit or test) called on every process in DDP
+class ReviewsDataModulePL(pl.LightningDataModule):
+    def __init__(self, seed, train_perc, val_perc, tokenizer_class, batch_size, weights):
+        super().__init__()
+        self.seed = seed
+        self.train_perc = train_perc
+        self.val_perc = val_perc
+        self.tokenizer_class = tokenizer_class
+        self.weights = weights
+        self.batch_size = batch_size
+
+    def prepare_data(self):
+        self.tokenizer_class.from_pretrained(pretrained_weights)
+
+    def setup(self, stage: Optional[str] = None):
+        df = pd.read_csv('https://github.com/clairett/pytorch-sentiment-classification/raw/master/data/SST2/train.tsv', delimiter='\t', header=None)
+        tokenizer = tokenizer_class.from_pretrained(pretrained_weights)
+        reviews_dataset = ReviewsDataset(df[0], tokenizer, df[1])
+        torch.manual_seed(self.seed)
+        train_size, val_size = int(self.train_perc * len(reviews_dataset)), int(self.val_perc * len(reviews_dataset))
+        self.train_data, self.valid_data, self.test_data = random_split(reviews_dataset, [train_size, val_size, len(reviews_dataset) - train_size - val_size])
+
+    def train_dataloader(self):
+        return DataLoader(self.train_data, batch_size=self.batch_size, collate_fn=collate_fn)
+
+    def val_dataloader(self):
+        return DataLoader(self.valid_data, batch_size=self.batch_size, collate_fn=collate_fn)
+
+    def test_dataloader(self):
+        return DataLoader(self.test_data, batch_size=self.batch_size, collate_fn=collate_fn)
+
+
 def version_from_params(p, shortcuts):
     return '__'.join([f'{short}_{p[orig]}' for orig, short in shortcuts.items()])
 
 
 # %%
 if __name__ == '__main__':
+    # Todo:
+    #   1. Process data only once ... done
+    #   2. Logging with multi-gpu
+    #   3. Checkpoints with multi-gpu
+    #   4.
+    #   5.
     # %%
     ic('start')
     warnings.filterwarnings('ignore')
@@ -118,7 +164,7 @@ if __name__ == '__main__':
         train_size=0.8,
         val_size=0.1,
         seed=0xDEAD,
-        batch=256,
+        batch=128,
         hidden=256,
         do=0.5,
         lr=3e-5,
@@ -130,18 +176,16 @@ if __name__ == '__main__':
     # .......................................................... Loading a pretrained model ........................................................
     # For DistilBERT, Load pretrained model/tokenizer:
     model_class, tokenizer_class, pretrained_weights = (ppb.DistilBertModel, ppb.DistilBertTokenizer, 'distilbert-base-uncased')
-    tokenizer = tokenizer_class.from_pretrained(pretrained_weights)
 
-    # .......................................................... Creating the dataloaders ..........................................................
-    df = pd.read_csv('https://github.com/clairett/pytorch-sentiment-classification/raw/master/data/SST2/train.tsv', delimiter='\t', header=None)
-    dataset = ReviewsDataset(df[0], tokenizer, df[1])
-    # creating the loaders
-    torch.manual_seed(params['seed'])
-    train_size, val_size = int(params['train_size'] * len(dataset)), int(params['val_size'] * len(dataset))
-    train_data, valid_data, test_data = random_split(dataset, [train_size, val_size, len(dataset) - train_size - val_size])
-    train_loader = DataLoader(train_data, batch_size=params['batch'], collate_fn=collate_fn)
-    valid_loader = DataLoader(valid_data, batch_size=params['batch'], collate_fn=collate_fn)
-    test_loader = DataLoader(test_data, batch_size=params['batch'], collate_fn=collate_fn)
+    # .......................................................... Creating the dataset ..............................................................
+    dataset = ReviewsDataModulePL(
+        params['seed'],
+        tokenizer_class=tokenizer_class,
+        weights=pretrained_weights,
+        batch_size=params['batch'],
+        train_perc=params['train_size'],
+        val_perc=params['val_size']
+    )
 
     # .......................................................... Creating the loggers/callbacks ....................................................
     shortcuts = dict(
@@ -173,11 +217,12 @@ if __name__ == '__main__':
     )
 
     # .......................................................... Model training ............................................................
+    # here we init bert outside the BertClassifier for simplicity
     model = model_class.from_pretrained(pretrained_weights)
     pl_model = BertClassifierPL(model, params)
 
     cb = [loss_checkpoint_callback, acc_checkpoint_callback]
     trainer = pl.Trainer(gpus=2, strategy='ddp', logger=logger, num_sanity_val_steps=0, max_epochs=6, callbacks=cb)
-    trainer.fit(pl_model, train_dataloaders=train_loader, val_dataloaders=valid_loader)
+    trainer.fit(pl_model, dataset)
     ic('end')
 
