@@ -86,25 +86,36 @@ class BertClassifierPL(pl.LightningModule):
             # lr_scheduler=lr_scheduler_config,
         )
 
-    def avg_output(self, loss_key, acc_key, outputs):
+    def _aggregate_output(self, loss_key, acc_key, outputs):
         losses, accs, total = [], [], 0
         for x in outputs:
             total += x['batch_size']
             losses.append(x[loss_key] * x['batch_size'])
             accs.append(x[acc_key] * x['batch_size'])
-        return torch.stack(losses).sum() / total, torch.stack(accs).sum() / total
+        return dict(loss=torch.stack(losses).sum(), acc=torch.stack(accs).sum(), cnt=total)
 
     def validation_epoch_end(self, outputs):
-        val_loss, val_acc = self.avg_output('val_loss', 'val_acc', outputs)
+        aggregated_output = self._aggregate_output('val_loss', 'val_acc', outputs)
+        # now need to get aggregated output from all gpus into one place
+        # done with all_gather, ... see https://github.com/PyTorchLightning/pytorch-lightning/discussions/6501#discussioncomment-589529
+        # before all_gather aggregated output was a dict of numbers (floats and ints)
+        # after all_gather it will be a dict of lists, and list length will be equal to the world size
+        aggregated_output = self.all_gather(aggregated_output)
+        aggregated_output = {k: sum(val) for k, val in aggregated_output.items()}
+        val_acc = aggregated_output['acc'] / aggregated_output['cnt']
+        val_loss = aggregated_output['loss'] / aggregated_output['cnt']
+
         self.logger.experiment.add_scalar('Loss/Val', val_loss, self.current_epoch)
         self.logger.experiment.add_scalar('Acc/Val', val_acc, self.current_epoch)
-        self.log('val_acc', val_acc, logger=False)
-        self.log('val_loss', val_loss,logger=False)
+        self.logger.experiment.add_scalar('Size/Val', aggregated_output['cnt'], self.current_epoch)
 
-    def training_epoch_end(self, outputs):
-        train_loss, train_acc = self.avg_output('loss', 'acc', outputs)
-        self.logger.experiment.add_scalar('Loss/Train', train_loss, self.current_epoch)
-        self.logger.experiment.add_scalar('Acc/Train', train_acc, self.current_epoch)
+        # self.log('val_acc', val_acc, logger=False)
+        # self.log('val_loss', val_loss,logger=False)
+
+    # def training_epoch_end(self, outputs):
+    #     train_loss, train_acc = self._aggregate_output('loss', 'acc', outputs)
+    #     self.logger.experiment.add_scalar('Loss/Train', train_loss, self.current_epoch)
+    #     self.logger.experiment.add_scalar('Acc/Train', train_acc, self.current_epoch)
 
 
 # A DataModule implements 6 key methods:
@@ -134,6 +145,9 @@ class ReviewsDataModulePL(pl.LightningDataModule):
         torch.manual_seed(self.seed)
         train_size, val_size = int(self.train_perc * len(reviews_dataset)), int(self.val_perc * len(reviews_dataset))
         self.train_data, self.valid_data, self.test_data = random_split(reviews_dataset, [train_size, val_size, len(reviews_dataset) - train_size - val_size])
+        ic(len(self.train_data))
+        ic(len(self.valid_data))
+        ic(len(self.test_data))
 
     def train_dataloader(self):
         return DataLoader(self.train_data, batch_size=self.batch_size, collate_fn=collate_fn)
@@ -222,7 +236,7 @@ if __name__ == '__main__':
     pl_model = BertClassifierPL(model, params)
 
     cb = [loss_checkpoint_callback, acc_checkpoint_callback]
-    trainer = pl.Trainer(gpus=2, strategy='ddp', logger=logger, num_sanity_val_steps=0, max_epochs=6, callbacks=cb)
+    trainer = pl.Trainer(gpus=2, strategy='ddp', logger=logger, num_sanity_val_steps=0, max_epochs=2, callbacks=cb)
     trainer.fit(pl_model, dataset)
     ic('end')
 
