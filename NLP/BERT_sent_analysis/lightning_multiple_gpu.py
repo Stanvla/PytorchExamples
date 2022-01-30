@@ -4,19 +4,22 @@ import warnings
 from datetime import datetime
 from typing import Optional
 
-import pandas as pd
-import pytorch_lightning as pl
-import torch
-import torch.nn.functional as F
-import torch.optim as optim
-import transformers as ppb
 from icecream import ic
+import pandas as pd
+import transformers as ppb
+
+import pytorch_lightning as pl
 from pytorch_lightning import seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
-from torch import nn
-from torch.utils.data import DataLoader, random_split
 from torchmetrics.functional import accuracy
+from pytorch_lightning.profiler import PyTorchProfiler
+
+import torch
+from torch import nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, random_split
 
 from data_preporation import collate_fn, ReviewsDataset
 
@@ -29,7 +32,6 @@ class BertClassifierPL(pl.LightningModule):
 
         self.dropout = nn.Dropout(p=params['do'])
         self.relu = nn.ReLU()
-        self.sigmoid = nn.Sigmoid()
 
         self.ln1 = nn.BatchNorm1d(768)
         self.fc = nn.Linear(768, params['hidden'])
@@ -47,14 +49,12 @@ class BertClassifierPL(pl.LightningModule):
         hidden_states = self.fc(self.dropout(self.relu(self.ln1(hidden_states))))
         outputs = self.fc_out(self.ln2(hidden_states))
         # [batch_size, 1]
-
-        # proba = [batch_size, ] - probability to be positive
-        return self.sigmoid(outputs)
+        return outputs
 
     def _perform_step(self, batch):
         inputs, labels, mask = batch['inputs'], batch['labels'], batch['attention_mask']
         output = self(inputs, mask).squeeze()
-        loss = F.binary_cross_entropy(output, labels)
+        loss = F.binary_cross_entropy_with_logits(output, labels)
         predictions = (output >= 1 / 2) + 0
         labels = labels.type(torch.cuda.IntTensor)
         acc = accuracy(predictions, labels)
@@ -134,6 +134,7 @@ class ReviewsDataModulePL(pl.LightningDataModule):
         self.tokenizer_class = tokenizer_class
         self.weights = weights
         self.batch_size = batch_size
+        self.num_workers = os.cpu_count() // 2
 
     def prepare_data(self):
         self.tokenizer_class.from_pretrained(pretrained_weights)
@@ -146,13 +147,15 @@ class ReviewsDataModulePL(pl.LightningDataModule):
         self.train_data, self.valid_data, self.test_data = random_split(reviews_dataset, [train_size, val_size, len(reviews_dataset) - train_size - val_size])
 
     def train_dataloader(self):
-        return DataLoader(self.train_data, batch_size=self.batch_size, collate_fn=collate_fn)
+        # num_workers tips
+        # https://pytorch-lightning.readthedocs.io/en/latest/guides/speed.html#num-workers
+        return DataLoader(self.train_data, batch_size=self.batch_size, collate_fn=collate_fn, pin_memory=True, num_workers=self.num_workers)
 
     def val_dataloader(self):
-        return DataLoader(self.valid_data, batch_size=self.batch_size, collate_fn=collate_fn)
+        return DataLoader(self.valid_data, batch_size=self.batch_size, collate_fn=collate_fn, pin_memory=True, num_workers=self.num_workers)
 
     def test_dataloader(self):
-        return DataLoader(self.test_data, batch_size=self.batch_size, collate_fn=collate_fn)
+        return DataLoader(self.test_data, batch_size=self.batch_size, collate_fn=collate_fn, pin_memory=True, num_workers=self.num_workers)
 
 
 def version_from_params(p, shortcuts):
@@ -186,10 +189,6 @@ def get_best_ckp_acc(config_dir, metric='val_acc'):
 
 # %%
 if __name__ == '__main__':
-    # Todo:
-    #   1. Testing (make sure metrics are the same) .. done
-    #   2. Loading from checkpoint ... done
-    #   3. Profiling
     # %%
     ic('start')
 
@@ -198,7 +197,7 @@ if __name__ == '__main__':
         train_size=0.8,
         val_size=0.1,
         seed=0xDEAD,
-        batch=128,
+        batch=220,
         hidden=256,
         do=0.5,
         lr=3e-5,
@@ -257,16 +256,26 @@ if __name__ == '__main__':
     pl_model = BertClassifierPL(model, params)
 
     cb = [loss_checkpoint_callback, acc_checkpoint_callback]
-    trainer = pl.Trainer(gpus=2, strategy='ddp', logger=logger, num_sanity_val_steps=0, max_epochs=2, callbacks=cb, deterministic=True)
 
-    hyppar_path = os.path.join(logs_dir, experiment_name, version_from_params(params, shortcuts))
-    if not os.path.isdir(hyppar_path):
-        ic('training')
-        trainer.fit(pl_model, dataset)
-        trainer.test(pl_model, dataset)
-    else:
-        ic('testing only')
-        ckp = get_best_ckp_acc(hyppar_path)
-        trainer.test(pl_model, dataset, ckpt_path=ckp)
+    # everything about profilers
+    # https://pytorch.org/tutorials/intermediate/tensorboard_profiler_tutorial.html#use-tensorboard-to-view-results-and-analyze-model-performance
+    profiler = PyTorchProfiler(filename='pytorch_profiler')
+
+    # when precision=16 Lightning uses native AMP ... automatic mixed precision
+    trainer = pl.Trainer(gpus=2, strategy='ddp', logger=logger, profiler=profiler, num_sanity_val_steps=0, max_epochs=3, callbacks=cb, deterministic=True, precision=16)
+
+    trainer.fit(pl_model, dataset)
+    trainer.test(pl_model, dataset)
+
+    # .......................................................... Loading from checkpoint .....................................................
+    # hyppar_path = os.path.join(logs_dir, experiment_name, version_from_params(params, shortcuts))
+    # if not os.path.isdir(hyppar_path):
+    #     ic('training')
+    #     trainer.fit(pl_model, dataset)
+    #     trainer.test(pl_model, dataset)
+    # else:
+    #     ic('testing only')
+    #     ckp = get_best_ckp_acc(hyppar_path)
+    #     trainer.test(pl_model, dataset, ckpt_path=ckp)
 
     ic('end')
