@@ -1,25 +1,24 @@
 # %%
+import os
+import warnings
+from datetime import datetime
 from typing import Optional
 
-from icecream import ic
-import os
 import pandas as pd
-from datetime import datetime
-import warnings
-
-import transformers as ppb
+import pytorch_lightning as pl
 import torch
-from torch import nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
-from data_preporation import  collate_fn, ReviewsDataset
-
-import pytorch_lightning as pl
-from torchmetrics.functional import accuracy
-from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.callbacks import ModelCheckpoint
+import transformers as ppb
+from icecream import ic
 from pytorch_lightning import seed_everything
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger
+from torch import nn
+from torch.utils.data import DataLoader, random_split
+from torchmetrics.functional import accuracy
+
+from data_preporation import collate_fn, ReviewsDataset
 
 
 class BertClassifierPL(pl.LightningModule):
@@ -52,30 +51,28 @@ class BertClassifierPL(pl.LightningModule):
         # proba = [batch_size, ] - probability to be positive
         return self.sigmoid(outputs)
 
-    def training_step(self, batch, batch_idx):
+    def _perform_step(self, batch):
         inputs, labels, mask = batch['inputs'], batch['labels'], batch['attention_mask']
-
         output = self(inputs, mask).squeeze()
         loss = F.binary_cross_entropy(output, labels)
-
-        predictions = (output >= 1/2) + 0
+        predictions = (output >= 1 / 2) + 0
         labels = labels.type(torch.cuda.IntTensor)
         acc = accuracy(predictions, labels)
+        # return {loss_key: loss, acc_key: acc, batch: inputs.shape[0]}
+        return loss, acc, inputs.shape[0]
 
-        return dict(loss=loss, acc=acc, batch_size=inputs.shape[0])
+    def training_step(self, batch, batch_idx):
+        loss, acc, batch_size = self._perform_step(batch)
+        return dict(loss=loss, acc=acc, batch_size=batch_size)
 
     # exactly as training step but can be different
     def validation_step(self, batch, batch_idx):
-        inputs, labels, mask = batch['inputs'], batch['labels'], batch['attention_mask']
+        loss, acc, batch_size = self._perform_step(batch)
+        return dict(val_loss=loss, val_acc=acc, batch_size=batch_size)
 
-        output = self(inputs, mask).squeeze()
-        loss = F.binary_cross_entropy(output, labels)
-
-        predictions = (output >= 1/2) + 0
-        labels = labels.type(torch.cuda.IntTensor)
-        acc = accuracy(predictions, labels)
-
-        return dict(val_loss=loss, val_acc=acc, batch_size=inputs.shape[0])
+    def test_step(self, batch, batch_idx):
+        loss, acc, batch_size = self._perform_step(batch)
+        return dict(test_loss=loss, test_acc=acc, batch_size=batch_size)
 
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=self.params['lr'])
@@ -93,32 +90,32 @@ class BertClassifierPL(pl.LightningModule):
             accs.append(x[acc_key] * x['batch_size'])
         return dict(loss=torch.stack(losses).sum(), acc=torch.stack(accs).sum(), cnt=total)
 
-    def validation_epoch_end(self, outputs):
-        aggregated_output = self._aggregate_output('val_loss', 'val_acc', outputs)
+    def _epoch_end(self, outputs, loss_key, acc_key, name):
+        # name can be {Train, Test, Val}
+        aggregated_output = self._aggregate_output(loss_key, acc_key, outputs)
         # now need to get aggregated output from all gpus into one place
         # done with all_gather, ... see https://github.com/PyTorchLightning/pytorch-lightning/discussions/6501#discussioncomment-589529
         # before all_gather aggregated output was a dict of numbers (floats and ints)
         # after all_gather it will be a dict of lists, and list length will be equal to the world size
         aggregated_output = self.all_gather(aggregated_output)
         aggregated_output = {k: sum(val) for k, val in aggregated_output.items()}
-        val_acc = aggregated_output['acc'] / aggregated_output['cnt']
-        val_loss = aggregated_output['loss'] / aggregated_output['cnt']
+        acc = aggregated_output['acc'] / aggregated_output['cnt']
+        loss = aggregated_output['loss'] / aggregated_output['cnt']
 
-        self.logger.experiment.add_scalar('Loss/Val', val_loss, self.current_epoch)
-        self.logger.experiment.add_scalar('Acc/Val', val_acc, self.current_epoch)
+        self.logger.experiment.add_scalar(f'Loss/{name}', loss, self.current_epoch)
+        self.logger.experiment.add_scalar(f'Acc/{name}', acc, self.current_epoch)
+        return acc, loss
 
+    def validation_epoch_end(self, outputs):
+        val_acc, val_loss = self._epoch_end(outputs, 'val_loss', 'val_acc', 'Val')
         self.log('val_acc', val_acc, logger=False, sync_dist=True)
-        self.log('val_loss', val_loss,logger=False, sync_dist=True)
+        self.log('val_loss', val_loss, logger=False, sync_dist=True)
 
     def training_epoch_end(self, outputs):
-        aggregated_output = self._aggregate_output('loss', 'acc', outputs)
-        aggregated_output = self.all_gather(aggregated_output)
-        aggregated_output = {k: sum(val) for k, val in aggregated_output.items()}
-        train_acc = aggregated_output['acc'] / aggregated_output['cnt']
-        train_loss = aggregated_output['loss'] / aggregated_output['cnt']
+        _, _ = self._epoch_end(outputs, 'loss', 'acc', 'Train')
 
-        self.logger.experiment.add_scalar('Loss/Train', train_loss, self.current_epoch)
-        self.logger.experiment.add_scalar('Acc/Train', train_acc, self.current_epoch)
+    def test_epoch_end(self, outputs):
+        _, _ = self._epoch_end(outputs, 'test_loss', 'test_acc', 'Test')
 
 
 # A DataModule implements 6 key methods:
@@ -144,14 +141,9 @@ class ReviewsDataModulePL(pl.LightningDataModule):
     def setup(self, stage: Optional[str] = None):
         df = pd.read_csv('https://github.com/clairett/pytorch-sentiment-classification/raw/master/data/SST2/train.tsv', delimiter='\t', header=None)
         tokenizer = tokenizer_class.from_pretrained(pretrained_weights)
-
         reviews_dataset = ReviewsDataset(df[0], tokenizer, df[1])
         train_size, val_size = int(self.train_perc * len(reviews_dataset)), int(self.val_perc * len(reviews_dataset))
         self.train_data, self.valid_data, self.test_data = random_split(reviews_dataset, [train_size, val_size, len(reviews_dataset) - train_size - val_size])
-
-        ic(len(self.train_data))
-        ic(len(self.valid_data))
-        ic(len(self.test_data))
 
     def train_dataloader(self):
         return DataLoader(self.train_data, batch_size=self.batch_size, collate_fn=collate_fn)
@@ -167,12 +159,37 @@ def version_from_params(p, shortcuts):
     return '__'.join([f'{short}_{p[orig]}' for orig, short in shortcuts.items()])
 
 
+def get_best_ckp_acc(config_dir, metric='val_acc'):
+    # given config dir, view all time directories and find the best checkpoint according to the metric
+    best_score, best_ckp = 0, ''
+    for d in os.listdir(config_dir):
+        full_path = os.path.join(config_dir, d)
+        if not os.path.isdir(full_path):
+            continue
+
+        ckp_path = os.path.join(full_path, 'checkpoints')
+        if not os.path.exists(ckp_path):
+            continue
+
+        for ckp in os.listdir(ckp_path):
+            if metric not in ckp:
+                continue
+            result = ckp.split('.')[0]
+            result = result.split('--')[-1]
+            result = float(result.split('=')[-1])
+            if result >= best_score:
+                best_ckp = os.path.join(ckp_path, ckp)
+                best_score = result
+    ic(best_ckp)
+    return best_ckp
+
+
 # %%
 if __name__ == '__main__':
     # Todo:
-    #   1. Process data only once ... done
-    #   2. Logging with multi-gpu ... done
-    #   3. Checkpoints with multi-gpu ... done
+    #   1. Testing (make sure metrics are the same) .. done
+    #   2. Loading from checkpoint ... done
+    #   3. Profiling
     # %%
     ic('start')
 
@@ -241,6 +258,15 @@ if __name__ == '__main__':
 
     cb = [loss_checkpoint_callback, acc_checkpoint_callback]
     trainer = pl.Trainer(gpus=2, strategy='ddp', logger=logger, num_sanity_val_steps=0, max_epochs=2, callbacks=cb, deterministic=True)
-    trainer.fit(pl_model, dataset)
-    ic('end')
 
+    hyppar_path = os.path.join(logs_dir, experiment_name, version_from_params(params, shortcuts))
+    if not os.path.isdir(hyppar_path):
+        ic('training')
+        trainer.fit(pl_model, dataset)
+        trainer.test(pl_model, dataset)
+    else:
+        ic('testing only')
+        ckp = get_best_ckp_acc(hyppar_path)
+        trainer.test(pl_model, dataset, ckpt_path=ckp)
+
+    ic('end')
