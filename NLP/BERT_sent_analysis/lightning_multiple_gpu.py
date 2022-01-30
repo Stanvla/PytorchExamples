@@ -4,22 +4,20 @@ import warnings
 from datetime import datetime
 from typing import Optional
 
-from icecream import ic
 import pandas as pd
-import transformers as ppb
-
 import pytorch_lightning as pl
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+import transformers as ppb
+from icecream import ic
 from pytorch_lightning import seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
-from torchmetrics.functional import accuracy
 from pytorch_lightning.profiler import PyTorchProfiler
-
-import torch
 from torch import nn
-import torch.optim as optim
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
+from torchmetrics.functional import accuracy
 
 from data_preporation import collate_fn, ReviewsDataset
 
@@ -201,7 +199,7 @@ if __name__ == '__main__':
         hidden=256,
         do=0.5,
         lr=3e-5,
-        epochs=40,
+        epochs=4,
         clip=1,
         save_fname='best_bert_sentiment.pt',
     )
@@ -262,7 +260,9 @@ if __name__ == '__main__':
     profiler = PyTorchProfiler(filename='pytorch_profiler')
 
     # when precision=16 Lightning uses native AMP ... automatic mixed precision
-    trainer = pl.Trainer(gpus=2, strategy='ddp', logger=logger, profiler=profiler, num_sanity_val_steps=0, max_epochs=3, callbacks=cb, deterministic=True, precision=16)
+    trainer = pl.Trainer(gpus=2, strategy='ddp', logger=logger, profiler=profiler, num_sanity_val_steps=0, max_epochs=params['epochs'], callbacks=cb,
+                         deterministic=True,
+                         precision=16)
 
     trainer.fit(pl_model, dataset)
     trainer.test(pl_model, dataset)
