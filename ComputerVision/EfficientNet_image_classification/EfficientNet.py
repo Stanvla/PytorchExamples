@@ -4,17 +4,18 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 
 from Augmentation import PerformAtMostN, MyRandomAdjustSharpness
-from collections import OrderedDict
+from collections import OrderedDict, namedtuple
+from torchvision.datasets import CIFAR10
+import os
+from icecream import ic
 
 
 def swish(t):
-    return F.sigmoid(t) * t
+    return torch.sigmoid(t) * t
 
 
 def kernel_size_to_str(kernel_size):
-    if len(kernel_size) == 1:
-        return f'{kernel_size[0]}x{kernel_size[0]}'
-    return f'{kernel_size[0]}x{kernel_size[1]}'
+    return f'{kernel_size}x{kernel_size}'
 
 
 class SeparableConv(nn.Module):
@@ -26,13 +27,14 @@ class SeparableConv(nn.Module):
             in_channels=channels,
             out_channels=channels,
             kernel_size=kernel_size,
+            stride=stride,
             groups=channels,
             padding=padding
         )
         self.pw_conv = nn.Conv2d(
             in_channels=channels,
             out_channels=channels,
-            kernel_size=(1,),
+            kernel_size=1,
         )
         self.bn = nn.BatchNorm2d(num_features=channels, momentum=bn_moment)
 
@@ -45,7 +47,7 @@ class SeparableConv(nn.Module):
 
 class ConvBNSwish(nn.Module):
     """Conv, BatchNorm [and Swish] grouped together for simplicity."""
-    def __init__(self, in_channels, out_channels, stride, bn_moment, activation=True, kernel_size=(1,), padding=0):
+    def __init__(self, in_channels, out_channels, stride, bn_moment, activation=True, kernel_size=1, padding=0):
         super(ConvBNSwish, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -95,7 +97,7 @@ class SqueezeAndExcitation(nn.Module):
         output = self.fc1(output)
         output = swish(output)
         output = self.fc2(output)
-        return F.sigmoid(output)
+        return torch.sigmoid(output)
 
 
 class MBConv(nn.Module):
@@ -112,26 +114,26 @@ class MBConv(nn.Module):
             stride=1,
             bn_moment=bn_moment,
             activation=True,
-            kernel_size=(1,),
+            kernel_size=1,
             padding=0,
         )
         # here will be performed resolution reduction, if stride != 1
-        self.sep_conv_block = SeparableConv(
+        self.sep_conv = SeparableConv(
             kernel_size=kernel_size,
             stride=stride,
-            channels=self.exp_channels,
+            channels=exp_channels,
             bn_moment=bn_moment,
             padding=padding,
         )
 
         # no activation here
         self.conv_bn2 = ConvBNSwish(
-            in_channels=self.exp_channels,
+            in_channels=exp_channels,
             out_channels=out_channels,
             stride=1,
             bn_moment=bn_moment,
             activation=False,
-            kernel_size=(1,),
+            kernel_size=1,
             padding=0,
         )
         self.se = None
@@ -139,14 +141,9 @@ class MBConv(nn.Module):
             self.se = SqueezeAndExcitation(out_channels, exp_factor)
 
     def forward(self, batch):
-        output = self.conv1(batch)
-        output = self.bn1(output)
-        output = swish(output)
-
-        output = self.sep_conv_block(output)
-
-        output = self.conv2(output)
-        output = self.bn2(output)
+        output = self.conv_bn_swish1(batch)
+        output = self.sep_conv(output)
+        output = self.conv_bn2(output)
 
         # can perform skip connection, squeeze-excitation and stochastic depth
         # only if stride == 1 and number of input and output channels is equal (then self.se is not None)
@@ -176,6 +173,7 @@ class MBConvBlock(nn.Module):
         self.channels = out_channels
         self.kernel_size = kernel_size
         self.exp_factor = exp_factor
+        self.padding = padding
 
         # handle first MBConv, it will reduce space resolution if needed (strided convolution)
         # also it will expand channels for the whole block
@@ -199,110 +197,143 @@ class MBConvBlock(nn.Module):
                     kernel_size=kernel_size,
                     in_channels=out_channels,
                     out_channels=out_channels,
-                    stride=(1,),
+                    stride=1,
                     bn_moment=bn_moment,
-                    padding=(0,),
+                    padding='same',
                     stochastic_depth=stochastic_depths[i],
                 )
             )
         self.mb_convs = nn.ModuleList(self.mb_convs)
 
     def forward(self, batch):
-        return self.mb_convs(batch)
+        output = batch
+        for m in self.mb_convs:
+            output = m(output)
+        return output
 
     def get_name(self):
         kernel_str = kernel_size_to_str(self.kernel_size)
-        return f'{self.layers_cnt} x MBConv{self.exp_factor}(ks={kernel_str},str={self.stride},ch={self.channels})'
+        return f'{self.layers_cnt} x MBConv{self.exp_factor}(ks={kernel_str},str={self.stride},ch={self.channels},pad={self.padding})'
 
 
 class EfficientNet(nn.Module):
     """Custom implementation of EfficientNetB0 according to the paper."""
-    def __init__(self, kernel_sizes, strides, channels, block_sizes, exp_factors, bn_moment, paddings, do, n_targets):
+    def __init__(self, arch_params, bn_moment, do, n_targets, head_features):
         super(EfficientNet, self).__init__()
-        # output_resolutions = [(112,112), (112,112), (56,56), (28,28), (14,14), (14,14), (7,7), (7,7)]
-        # n_blocks = len(block_sizes) (=7)
-
-        # block_sizes = [1, 2, 2, 3, 3, 4, 1],
-        #   len(block_sizes) == n_blocks
-
-        # channels_lst = [32, 16, 24, 40, 80, 112, 192, 320],
-        #   len(channels_lst) == n_blocks + 1
-
-        # kernel_sizes = [(3,3), (3,3), (3,3), (5,5), (3,3), (5,5), (5,5), (3,3)]
-        #   len(kernel_sizes) == n_blocks + 1
-
-        # paddings = [(0,1), 0, (0,1), (1,2), (0,1), 0, (1,2), 0]
-        #   len(paddings) == n_blocks + 1
-
-        # strides = [2, 1, 2, 2, 2, 1, 2, 1]
-        #   len(strides) == n_blocks + 1
-
-        # exp_factors = [1, 6, 6, 6, 6, 6, 6]
 
         first_conv = ConvBNSwish(
-            in_channels=channels[0],
-            out_channels=channels[1],
-            stride=strides[0],
+            in_channels=arch_params[0].channels_in,
+            out_channels=arch_params[0].channels_out,
+            stride=arch_params[0].stride,
             activation=False,
-            kernel_size=kernel_sizes[0],
+            kernel_size=arch_params[0].kernel_size,
             bn_moment=bn_moment,
+            padding=arch_params[0].padding
         )
         blocks_lst = [(first_conv.get_name(), first_conv)]
 
-        stochastic_depth = torch.linspace(0, 0.5, sum(block_sizes) + 1)
+        stochastic_depth = torch.linspace(0, 0.5, sum([p.block_size for p in arch_params]) + 1)
         stochastic_depth_idx = 1
 
-        for ks, st, ch_in, ch_out, l_cnt, e_fact, pad in zip(kernel_sizes[1:], strides[1:], channels[1:-1], channels[2:], block_sizes, exp_factors, paddings):
+        for p in arch_params[1:]:
             block = MBConvBlock(
-                layers_cnt=l_cnt,
-                stride=st,
-                in_channels=ch_in,
-                out_channels=ch_out,
-                kernel_size=ks,
+                layers_cnt=p.block_size,
+                stride=p.stride,
+                in_channels=p.channels_in,
+                out_channels=p.channels_out,
+                kernel_size=p.kernel_size,
                 bn_moment=bn_moment,
-                exp_factor=e_fact,
-                stochastic_depths=stochastic_depth[stochastic_depth_idx: stochastic_depth_idx + l_cnt],
-                padding=pad
+                exp_factor=p.exp_factor,
+                stochastic_depths=stochastic_depth[stochastic_depth_idx: stochastic_depth_idx + p.block_size],
+                padding=p.padding
             )
             blocks_lst.append([block.get_name(), block])
-            stochastic_depth_idx += l_cnt
+            stochastic_depth_idx += p.block_size
 
-        self.last_conv =
+        self.block_dct = OrderedDict(blocks_lst)
+        self.conv_head = ConvBNSwish(
+            in_channels=arch_params[-1].channels_out,
+            out_channels=head_features,
+            stride=1,
+            bn_moment=bn_moment,
+            activation=False,
+            kernel_size=1,
+            padding=0,
+        )
         self.drop_out = nn.Dropout(do)
-        self.Linear =
+        self.linear = nn.Linear(in_features=head_features, out_features=n_targets)
 
-    def forward(self, batch, training=True):
-        for i, do in zip():
-            pass
+    def forward(self, batch):
+        output = batch
+        print(output.shape)
+        for name, block in self.block_dct.items():
+            output = block(output)
+            print(f'{name:50} {output.shape}')
+        output = self.conv_head(output)
+        output = torch.mean(output, dim=(2, 3), keepdim=False)
+        output = self.drop_out(output)
+        print(output.shape)
+        return self.linear(output)
+
 
 if __name__ == '__main__':
     image_augmentation = None
-    new_resolution = 56
+    new_resolution = 224
 
     to_tensor_tr = T.ToTensor()
-    color_and_sharpness_tr = PerformAtMostN(
-        [T.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.01),
-         MyRandomAdjustSharpness(0.5, 3, 10, prob=1)],
-        prob=0.5,
-        n=2
-    )
+    cifar10_train = CIFAR10(os.path.join(os.getcwd(), 'train'), download=True)
+    xs = torch.stack([to_tensor_tr(cifar10_train[i][0]) for i in range(10)])
 
-    rotation_and_perspective_tr = PerformAtMostN(
-        [T.RandomRotation((-20, 20)),
-         T.RandomPerspective(distortion_scale=0.2)],
-        prob=0.5,
-        n=2,
-    )
+    Block = namedtuple('Block', 'out_res block_size channels_in channels_out kernel_size stride exp_factor padding')
+    # out_res is the output resolution it is for debugging
+    # first dict is for the first convolution
+    params = [
+        Block(out_res=112, block_size=0, channels_in=3,   channels_out=32,  kernel_size=3, stride=2, exp_factor=0, padding=1),
+        Block(out_res=112, block_size=1, channels_in=32,  channels_out=16,  kernel_size=3, stride=1, exp_factor=1, padding='same'),
+        Block(out_res=56,  block_size=2, channels_in=16,  channels_out=24,  kernel_size=3, stride=1, exp_factor=6, padding='same'),
+        Block(out_res=28,  block_size=2, channels_in=24,  channels_out=40,  kernel_size=5, stride=2, exp_factor=6, padding=2),
+        Block(out_res=14,  block_size=3, channels_in=40,  channels_out=80,  kernel_size=3, stride=2, exp_factor=6, padding=1),
+        Block(out_res=14,  block_size=3, channels_in=80,  channels_out=112, kernel_size=5, stride=2, exp_factor=6, padding=2),
+        Block(out_res=7,   block_size=4, channels_in=112, channels_out=192, kernel_size=5, stride=2, exp_factor=6, padding=2),
+        Block(out_res=7,   block_size=1, channels_in=192, channels_out=320, kernel_size=3, stride=1, exp_factor=6, padding='same'),
+    ]
 
-    transforms = nn.Sequential(
-        T.Resize(new_resolution),
-        T.RandomApply(nn.ModuleList([
-                T.RandomResizedCrop(new_resolution, scale=(0.7, 1.0)),
-                color_and_sharpness_tr,
-                T.RandomErasing(value='random'),
-                T.RandomHorizontalFlip(),
-                rotation_and_perspective_tr
-            ]),
-            p=0.85
-        )
+    model = EfficientNet(
+        params,
+        bn_moment=0.99,
+        do=0.2,
+        n_targets=10,
+        head_features=1280
     )
+    # output_resolutions = [(112,112), (112,112), (56,56), (28,28), (14,14), (14,14), (7,7), (7,7)]
+
+    resize_tr = T.Resize(new_resolution)
+    model(resize_tr(xs))
+
+
+    # color_and_sharpness_tr = PerformAtMostN(
+    #     [T.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.01),
+    #      MyRandomAdjustSharpness(0.5, 3, 10, prob=1)],
+    #     prob=0.5,
+    #     n=2
+    # )
+    #
+    # rotation_and_perspective_tr = PerformAtMostN(
+    #     [T.RandomRotation((-20, 20)),
+    #      T.RandomPerspective(distortion_scale=0.2)],
+    #     prob=0.5,
+    #     n=2,
+    # )
+    #
+    # transforms = nn.Sequential(
+    #     T.Resize(new_resolution),
+    #     T.RandomApply(nn.ModuleList([
+    #             T.RandomResizedCrop(new_resolution, scale=(0.7, 1.0)),
+    #             color_and_sharpness_tr,
+    #             T.RandomErasing(value='random'),
+    #             T.RandomHorizontalFlip(),
+    #             rotation_and_perspective_tr
+    #         ]),
+    #         p=0.85
+    #     )
+    # )
