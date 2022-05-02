@@ -3,9 +3,9 @@ conda install -y -c conda-forge tokenizers transformers datasets youtokentome py
 conda install -y -c conda-forge/label/cf202003 transformers
 conda install -y -c pytorch torchaudio torchtext
 conda install -y -c anaconda scikit-learn
-pip install torch-tb-profiler
+yes | pip install torch-tb-profiler
 
-jupyter notebook --no-browser --ip=0.0.0.0 --port=8080 --allow-root &
+# jupyter notebook --no-browser --ip=0.0.0.0 --port=8080 --allow-root &
 
 
 # to download things from gdrive

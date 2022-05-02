@@ -3,11 +3,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
-# from Augmentation import PerformAtMostN, MyRandomAdjustSharpness
 from torchvision.datasets import CIFAR10
 from torch.utils.data import DataLoader, Subset
 
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger
 
 from sklearn.model_selection import train_test_split
 
@@ -16,6 +17,7 @@ import math
 from icecream import ic
 from typing import Optional
 from collections import OrderedDict, namedtuple
+from datetime import datetime
 
 
 def swish(t):
@@ -157,16 +159,17 @@ class MBConv(nn.Module):
         # can perform skip connection, squeeze-excitation and stochastic depth
         # only if stride == 1 and number of input and output channels is equal (then self.se is not None)
         if self.stride == 1 and self.se is not None:
-            print(f'{self.layer_idx} skip connection')
+            # print(f'{self.layer_idx} skip connection')
             weights = self.se(output)
+            # ic(weights.get_device())
             # weights.shape = [batch, channels]
             # output.shape = [batch, channels, H, W]
             output = output * weights.view((output.shape[0], output.shape[1], 1, 1))
-
+            # ic(output.get_device())
             # stochastic depth
             if self.training:
-                print(f'{self.layer_idx} stoch depth')
-                survived = torch.rand(output.shape[0]) < self.stochastic_depth_prob
+                # print(f'{self.layer_idx} stoch depth')
+                survived = torch.rand(output.shape[0], device=batch.get_device()) < self.stochastic_depth_prob
                 survived = survived.type(torch.float).view(survived.shape[0], 1, 1, 1)
                 output = (survived / self.stochastic_depth_prob) * survived
 
@@ -177,7 +180,7 @@ class MBConv(nn.Module):
 
 class MBConvBlock(nn.Module):
     """Just a list of MBConvs, with careful handling of first MBConv, should take care of spatial resolution and channels."""
-    def __init__(self, layers_cnt, stride, in_channels, out_channels, kernel_size, bn_moment, exp_factor, stochastic_depths, padding, layers_offset):
+    def __init__(self, layers_cnt, stride, in_channels, out_channels, kernel_size, bn_moment, exp_factor, stochastic_depth, padding, layers_offset):
         super(MBConvBlock, self).__init__()
         self.layers_cnt = layers_cnt
         self.stride = stride
@@ -197,7 +200,7 @@ class MBConvBlock(nn.Module):
                 stride=stride,
                 bn_moment=bn_moment,
                 padding=padding,
-                stochastic_depth=stochastic_depths[0],
+                stochastic_depth=stochastic_depth,
                 layer_idx=layers_offset,
             )
         ]
@@ -212,7 +215,7 @@ class MBConvBlock(nn.Module):
                     stride=1,
                     bn_moment=bn_moment,
                     padding='same',
-                    stochastic_depth=stochastic_depths[i],
+                    stochastic_depth=stochastic_depth,
                     layer_idx=layers_offset + i,
                 )
             )
@@ -255,14 +258,14 @@ class EfficientNet(nn.Module):
                 kernel_size=p.kernel_size,
                 bn_moment=bn_moment,
                 exp_factor=p.exp_factor,
-                stochastic_depths=stochastic_depth,
+                stochastic_depth=stochastic_depth,
                 padding=p.padding,
                 layers_offset=layers_offset,
             )
             blocks_lst.append([block.get_name(), block])
             layers_offset += p.block_size
 
-        self.block_dct = OrderedDict(blocks_lst)
+        self.block_dct = nn.ModuleDict(OrderedDict(blocks_lst))
         self.conv_head = ConvBNSwish(
             in_channels=arch_params[-1].channels_out,
             out_channels=head_features,
@@ -277,28 +280,35 @@ class EfficientNet(nn.Module):
 
     def forward(self, batch):
         output = batch
-        print(output.shape)
+        # print(output.shape)
         for name, block in self.block_dct.items():
             output = block(output)
             # print(f'{name:50} {output.shape}')
         output = self.conv_head(output)
         output = torch.mean(output, dim=(2, 3), keepdim=False)
         output = self.drop_out(output)
-        print(output.shape)
+        # print(output.shape)
         return self.linear(output)
 
 
-class EfficientNetPL(pl.LightningDataModule):
-    def __init__(self, eff_net, lr, weight_decay, momentum):
+class EfficientNetPL(pl.LightningModule):
+    def __init__(self, eff_net, target_lr, weight_decay, momentum, optim_eps, warm_up_epochs, lr_const_epochs, exp_decay_lr, rmsprop_alpha):
         super(EfficientNetPL, self).__init__()
         self.eff_net = eff_net
-        self.init_lr = lr
+
+        self.target_lr = target_lr
         self.weight_decay = weight_decay
         self.momentum = momentum
-        self.optim_eps = 0.001
+        self.optim_eps = optim_eps
+
+        self.warm_up_epochs = warm_up_epochs
+        self.lr_const_epochs = lr_const_epochs
+        self.exp_decay_lr = exp_decay_lr
+        self.rmsprop_alpha = rmsprop_alpha
 
     def forward(self, batch):
         return self.eff_net(batch)
+
 
     def _perform_step(self, batch):
         images, targets = batch['images'], batch['targets']
@@ -325,16 +335,63 @@ class EfficientNetPL(pl.LightningDataModule):
         return dict(loss=loss, acc=acc, batch_size=batch_size)
 
     def configure_optimizers(self):
-        pass
+        # in the paper only exponential decay was used
+        # implemented linear warm-up, constant and exponential decay scheduler
+        # inspired from https://huggingface.co/docs/transformers/v4.16.2/en/main_classes/optimizer_schedules
+        def lr_scheduler(cur_epoch):
+            if cur_epoch < self.warm_up_epochs:
+                # perform warm-up
+                scalar = cur_epoch / self.warm_up_epochs
+            elif self.warm_up_epochs <= cur_epoch < self.lr_const_epochs:
+                # stay constant after warmup
+                scalar = 1
+            else:
+                # do exponential decay every second epoch
+                scalar = 1
+                if cur_epoch % 2 == 0:
+                    scalar = self.exp_decay_lr
+            assert scalar >= 0
+            return float(scalar)
+
+        optimizer = torch.optim.RMSprop(
+            self.parameters(),
+            lr=self.target_lr,
+            momentum=self.momentum,
+            eps=self.optim_eps,
+            weight_decay=self.weight_decay,
+            alpha=self.rmsprop_alpha,
+        )
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_scheduler)
+        return dict(optimizer=optimizer, lr_scheduler=scheduler)
+
+    def _epoch_end(self, outputs, name):
+        epoch_size = sum(out['batch_size'] for out in outputs)
+        epoch_size = self.all_gather(epoch_size).sum()
+
+        loss = sum(out['loss'] * out['batch_size'] for out in outputs)
+        loss = self.all_gather(loss).sum() / epoch_size
+
+        acc = sum(out['acc'] * out['batch_size'] for out in outputs)
+        acc = self.all_gather(acc).sum() / epoch_size
+
+        # log only at rank 0
+        if self.global_rank == 0:
+            # ic(total_loss, masked_loss, unmasked_loss, total_acc, masked_acc, unmasked_acc)
+            self.logger.experiment.add_scalar(f'Loss Total/{name}', loss, self.current_epoch)
+            self.logger.experiment.add_scalar(f'Acc Total/{name}', acc, self.current_epoch)
+        return loss, acc
 
     def training_epoch_end(self, outputs):
-        pass
+        self._epoch_end(outputs, 'Train')
 
     def validation_epoch_end(self, outputs):
-        pass
+        loss, acc = self._epoch_end(outputs, 'Val')
+        # used for checkpoints
+        self.log('val_loss', loss, logger=False, sync_dist=True)
+        self.log('val_acc', acc, logger=False, sync_dist=True)
 
     def test_epoch_end(self, outputs):
-        pass
+        self._epoch_end(outputs, 'Test')
 
 
 class Cifar10PL(pl.LightningDataModule):
@@ -354,7 +411,7 @@ class Cifar10PL(pl.LightningDataModule):
         if not os.path.isdir(os.path.join(self.path, 'train')):
             CIFAR10(os.path.join(os.getcwd(), 'train'), download=True)
         if not os.path.isdir(os.path.join(self.path, 'test')):
-            CIFAR10(os.path.join(os.getcwd(), 'train'), train=False, download=True)
+            CIFAR10(os.path.join(os.getcwd(), 'test'), train=False, download=True)
 
     def setup(self, stage: Optional[str] = None):
         """(things to do on every accelerator in distributed mode) called on every process in DDP."""
@@ -393,14 +450,6 @@ class Cifar10PL(pl.LightningDataModule):
         return self.get_dataloader(self.test)
 
 
-def collate_fn(lst):
-    images, targets = [], []
-    for i, t in lst:
-        images.append(i)
-        targets.append(t)
-    return dict(images=torch.stack(images), targets=torch.tensor(targets))
-
-
 class TrainTransform:
     def __init__(self, trainsforms):
         self.trans = trainsforms
@@ -412,11 +461,34 @@ class TrainTransform:
         return output
 
 
-# %%
-if __name__ == '__main__':
-    # %%
+def collate_fn(lst):
+    images, targets = [], []
+    for i, t in lst:
+        images.append(i)
+        targets.append(t)
+    result = dict(images=torch.stack(images).type(torch.FloatTensor), targets=torch.tensor(targets))
+    return result
 
-    image_augmentation = None
+
+def version_name_from_params(batch_size, params):
+    shortcuts = dict(
+        target_lr='lr',
+        warm_up_epochs='wu',
+        lr_const_epochs='lr_const',
+        exp_decay='dec',
+    )
+    result = f'gpus={torch.cuda.device_count()},bs={batch_size},'
+
+    resul_lst = []
+    for k, v in params.items():
+        if k in shortcuts:
+            resul_lst.append(f'{shortcuts[k]}={v}')
+
+    return result + ','.join(resul_lst)
+
+
+if __name__ == '__main__':
+    # ........................................................... Creating the dataset ...........................................................
     new_resolution = 224
 
     train_transform = TrainTransform([
@@ -433,21 +505,13 @@ if __name__ == '__main__':
     dataset = Cifar10PL(
         path=os.getcwd(),
         train_perc=0.7,
-        batch_size=20,
+        batch_size=128,
         seed=0xDEAD,
         train_tr=train_transform,
         test_tr=test_transform
     )
-    dataset.setup()
 
-    train_loader = dataset.train_dataloader()
-    for i, b in enumerate(train_loader):
-        if i == 5:
-            break
-        ic(b)
-
-
-    # %%
+    # ....................................................... Preparing EfficientNet model .......................................................
     # named tuple represents parameters for each block of Efficient net
     Block = namedtuple('Block', 'out_res block_size channels_in channels_out kernel_size stride exp_factor padding')
     # out_res is the output resolution it is for debugging
@@ -469,36 +533,71 @@ if __name__ == '__main__':
         bn_moment=0.99,
         do=0.2,
         n_targets=10,
-        head_features=1280
+        head_features=1280,
+        stochastic_depth=0.8,
+    )
+    # ........................................................ Defining training parameters ......................................................
+    params = dict(
+        eff_net=model,
+        target_lr=0.0007,
+        weight_decay=1e-5,  # from the paper
+        momentum=0.9,  # from the paper
+        optim_eps=0.001,
+        warm_up_epochs=7,
+        lr_const_epochs=3,
+        # not from paper, in the paper they had 0.97 but updated it every 2.4 epochs, wtf...
+        # update 0.97 every 2.4 epoch is empirically equal to 0.975 every second epoch (I plotted it:-))
+        exp_decay_lr=0.975,
+        rmsprop_alpha=0.9,  # from the paper
+    )
+    # ....................................................... Creating Loggers and callbacks .....................................................
+
+    # time rather should not contain any colon
+    time = datetime.now().strftime('%d.%m__%H.%M')
+    logs_dir = 'logs'
+    experiment_name = 'cifar10'
+
+    logger = TensorBoardLogger(
+        logs_dir,
+        name=experiment_name,
+        version=version_name_from_params(dataset.bs, params),
+        sub_dir=time
+    )
+    path = os.path.join(logs_dir, experiment_name, version_name_from_params(dataset.bs, params), time, 'checkpoints')
+
+    # save based on valid loss and valid acc
+    loss_checkpoint_callback = ModelCheckpoint(
+        monitor="val_loss",
+        dirpath=path,
+        filename='{epoch:02d}--{val_loss:.2f}',
+        mode='min'
+    )
+    acc_checkpoint_callback = ModelCheckpoint(
+        monitor="val_acc",
+        dirpath=path,
+        filename='{epoch:02d}--{val_acc:.2f}',
+        mode='max'
+    )
+    # ................................................................. Training .................................................................
+
+    pl_model = EfficientNetPL(**params)
+
+    trainer = pl.Trainer(
+        gpus=torch.cuda.device_count(),
+        # gpus=1,
+        strategy='ddp',
+        logger=logger,
+        num_sanity_val_steps=0,
+        max_epochs=20,
+        callbacks=[loss_checkpoint_callback, acc_checkpoint_callback],
+        deterministic=True,
+        precision=16,
+        limit_train_batches=20,
+        limit_val_batches=20,
     )
 
-    resize_tr = T.Resize(new_resolution)
-    # model(resize_tr(xs))
+    trainer.fit(pl_model, dataset)
+    trainer.test(pl_model, dataset)
+    # ................................................................ Evaluation ................................................................
 
 
-    # color_and_sharpness_tr = PerformAtMostN(
-    #     [T.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.01),
-    #      MyRandomAdjustSharpness(0.5, 3, 10, prob=1)],
-    #     prob=0.5,
-    #     n=2
-    # )
-    #
-    # rotation_and_perspective_tr = PerformAtMostN(
-    #     [T.RandomRotation((-20, 20)),
-    #      T.RandomPerspective(distortion_scale=0.2)],
-    #     prob=0.5,
-    #     n=2,
-    # )
-    #
-    # transforms = nn.Sequential(
-    #     T.Resize(new_resolution),
-    #     T.RandomApply(nn.ModuleList([
-    #             T.RandomResizedCrop(new_resolution, scale=(0.7, 1.0)),
-    #             color_and_sharpness_tr,
-    #             T.RandomErasing(value='random'),
-    #             T.RandomHorizontalFlip(),
-    #             rotation_and_perspective_tr
-    #         ]),
-    #         p=0.85
-    #     )
-    # )
