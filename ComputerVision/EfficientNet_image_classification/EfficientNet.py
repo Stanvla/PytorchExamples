@@ -431,9 +431,10 @@ class Cifar10PL(pl.LightningDataModule):
 
         self.test = CIFAR10(os.path.join(os.getcwd(), 'test'), transform=self.test_tr)
 
-    def get_dataloader(self, dataset):
+    def get_dataloader(self, dataset, shuffle):
         return DataLoader(
             dataset,
+            shuffle=shuffle,
             batch_size=self.bs,
             collate_fn=collate_fn,
             pin_memory=True,
@@ -441,13 +442,13 @@ class Cifar10PL(pl.LightningDataModule):
         )
 
     def train_dataloader(self):
-        return self.get_dataloader(self.train)
+        return self.get_dataloader(self.train, True)
 
     def val_dataloader(self):
-        return self.get_dataloader(self.val)
+        return self.get_dataloader(self.val, False)
 
     def test_dataloader(self):
-        return self.get_dataloader(self.test)
+        return self.get_dataloader(self.test, False)
 
 
 class TrainTransform:
@@ -505,7 +506,7 @@ if __name__ == '__main__':
     dataset = Cifar10PL(
         path=os.getcwd(),
         train_perc=0.7,
-        batch_size=128,
+        batch_size=225,
         seed=0xDEAD,
         train_tr=train_transform,
         test_tr=test_transform
@@ -539,12 +540,12 @@ if __name__ == '__main__':
     # ........................................................ Defining training parameters ......................................................
     params = dict(
         eff_net=model,
-        target_lr=0.0007,
+        target_lr=0.0006,
         weight_decay=1e-5,  # from the paper
         momentum=0.9,  # from the paper
         optim_eps=0.001,
-        warm_up_epochs=7,
-        lr_const_epochs=3,
+        warm_up_epochs=5,
+        lr_const_epochs=5,
         # not from paper, in the paper they had 0.97 but updated it every 2.4 epochs, wtf...
         # update 0.97 every 2.4 epoch is empirically equal to 0.975 every second epoch (I plotted it:-))
         exp_decay_lr=0.975,
@@ -584,20 +585,19 @@ if __name__ == '__main__':
 
     trainer = pl.Trainer(
         gpus=torch.cuda.device_count(),
-        # gpus=1,
         strategy='ddp',
         logger=logger,
         num_sanity_val_steps=0,
-        max_epochs=20,
+        max_epochs=120,
         callbacks=[loss_checkpoint_callback, acc_checkpoint_callback],
         deterministic=True,
         precision=16,
-        limit_train_batches=20,
-        limit_val_batches=20,
+        # limit_train_batches=20,
+        # limit_val_batches=20,
     )
 
     trainer.fit(pl_model, dataset)
-    trainer.test(pl_model, dataset)
     # ................................................................ Evaluation ................................................................
+    trainer.test(pl_model, dataset)
 
 
